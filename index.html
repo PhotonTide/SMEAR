@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -110,7 +111,7 @@
 
 <div id="gate">
   <h1>SMEAR</h1>
-  <p>reality trails. the moving figure leaves fading afterimages of itself along its path, stamped where it was. tap to wake the camera, then record video or grab a jpg straight to your camera roll.</p>
+  <p>reality trails. as you move, a full afterimage of you is left behind, dissolving where you were. tap to wake the camera, then record video or grab a jpg straight to your camera roll.</p>
   <button id="enter">ENTER</button>
 </div>
 
@@ -119,8 +120,8 @@
 <script>
 /* ============================================================
    SMEAR // reality trails
-   afterimage: in-place decay + optical-flow streak + hue-by-age
-   composite polish: bloom, non-accumulating breathe, palettes
+   afterimage w/ region fill: a blurred low-res activity mask
+   prints the whole moving figure into the trail, not just edges
    ============================================================ */
 const cvs=document.getElementById('gl');
 const gl=cvs.getContext('webgl2',{preserveDrawingBuffer:false,antialias:false,alpha:false});
@@ -146,13 +147,25 @@ vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.,2./3.,1./3.,3.);
   vec3 p=abs(fract(c.xxx+K.xyz)*6.-K.www); return c.z*mix(K.xxx,clamp(p-K.xxx,0.,1.),c.y); }
 `;
 
-/* afterimage: old paint fades in place, moving figure stamps new paint on top */
+/* activity mask: frame difference, rendered at low res so it fills into a
+   soft blob covering the whole moving region rather than just its edges */
+const MOTION=`#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 frag;
+uniform sampler2D uCam,uPrev; uniform float uMirror;
+`+COMMON+`
+void main(){ vec2 uv=vUv; if(uMirror>0.5) uv.x=1.0-uv.x;
+  float d=abs(luma(texture(uCam,uv).rgb)-luma(texture(uPrev,uv).rgb));
+  frag=vec4(vec3(d),1.0); }`;
+
+/* afterimage: old paint fades in place, moving figure stamps new paint on top.
+   injection is weighted by the filled region mask, so the whole face prints. */
 const DYE=`#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 frag;
-uniform sampler2D uDye,uCam,uPrev;
+uniform sampler2D uDye,uCam,uPrev,uMotion,uSeg;
 uniform vec2 uRes;
-uniform float uTime,uDecay,uSens,uSmear,uMelt,uMosh,uBlock,uHue,uMirror;
+uniform float uTime,uDecay,uSens,uFill,uSmear,uMelt,uMosh,uBlock,uHue,uMirror,uUseSeg;
 `+COMMON+`
 void main(){
   vec2 uv=vUv; vec2 cuv=uv; if(uMirror>0.5) cuv.x=1.0-cuv.x;
@@ -161,7 +174,16 @@ void main(){
   vec3 cam =texture(uCam ,cuv).rgb;
   vec3 prev=texture(uPrev,cuv).rgb;
   float It=luma(cam)-luma(prev);
-  float motion=smoothstep(uSens,uSens+0.08, abs(It));
+
+  float edge=smoothstep(uSens,uSens+0.08, abs(It));               // crisp moving edges
+  float region=smoothstep(uSens*0.5, uSens*0.5+0.12, texture(uMotion,uv).r); // filled blob
+  float inj;
+  if(uUseSeg>0.5){
+    float seg=smoothstep(0.35,0.65, texture(uSeg,cuv).r);         // person only, bg stays locked
+    inj = seg*uFill;
+  } else {
+    inj = clamp(max(edge, region*uFill), 0.0, 1.0);               // luma fallback
+  }
 
   float Ix=luma(texture(uCam,cuv+vec2(tx.x,0.)).rgb)-luma(texture(uCam,cuv-vec2(tx.x,0.)).rgb);
   float Iy=luma(texture(uCam,cuv+vec2(0.,tx.y)).rgb)-luma(texture(uCam,cuv-vec2(0.,tx.y)).rgb);
@@ -169,8 +191,8 @@ void main(){
   vec2 fdir = length(flow)>1e-5 ? normalize(flow) : vec2(0.0);
 
   vec2 ruv=uv;
-  ruv += fdir * uSmear * 3.0 * tx * (0.4+motion);      // bounded streak, stays put
-  ruv = 0.5+(ruv-0.5)*(1.0-uMelt*0.02);                // optional slow radial melt
+  ruv += fdir * uSmear * 3.0 * tx * (0.4+inj);
+  ruv = 0.5+(ruv-0.5)*(1.0-uMelt*0.02);
 
   vec2 block=floor(uv*uBlock)/uBlock;
   float bh=hash(block+floor(uTime*8.0)*0.137);
@@ -179,21 +201,19 @@ void main(){
   ruv -= bdir*bmot*uMosh*0.05*step(0.55,hash(block+0.7));
 
   vec3 old=texture(uDye,ruv).rgb * uDecay;
-  vec3 D=max(old, cam*motion);
+  vec3 D=max(old, cam*inj);          // stamp the whole moving figure into the trail
   D=hueRot(D, uHue*0.04);
   frag=vec4(D,1.0);
 }`;
 
-/* bloom: bright-pass extract (runs at quarter res) */
 const BRIGHT=`#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 frag;
-uniform sampler2D uDye; uniform float uThresh;
+uniform sampler2D uTex; uniform float uThresh;
 `+COMMON+`
-void main(){ vec3 c=texture(uDye,vUv).rgb; float b=smoothstep(uThresh,uThresh+0.25,luma(c));
+void main(){ vec3 c=texture(uTex,vUv).rgb; float b=smoothstep(uThresh,uThresh+0.25,luma(c));
   frag=vec4(c*b,1.0); }`;
 
-/* separable gaussian blur */
 const BLUR=`#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 frag;
@@ -232,8 +252,6 @@ vec3 duo(float t){ t=clamp(t,0.,1.);
 vec3 pal(float t,float m){ if(m<1.5) return thermal(t); if(m<2.5) return acid(t); return duo(t); }
 void main(){
   vec2 uv=vUv; float t=uTime;
-
-  /* non-accumulating breathe: warps only the final view, never the stored trail */
   vec2 bo = uBreathe*0.01*0.5*vec2(
       sin(uv.y*8.0+t*1.3)+0.5*sin(uv.y*17.0-t*0.7),
       cos(uv.x*8.0-t*1.1)+0.5*cos(uv.x*15.0+t*0.9));
@@ -258,7 +276,7 @@ void main(){
   base*=uBase;
 
   vec3 col=1.0-(1.0-base)*(1.0-tr);
-  vec3 bloom=texture(uBloomTex,wuv).rgb;      // glow the hot afterimage edges
+  vec3 bloom=texture(uBloomTex,wuv).rgb;
   col=1.0-(1.0-col)*(1.0-bloom*uBloom);
 
   col*=1.0-uScan*0.5*(0.5+0.5*sin(uv.y*uRes.y*1.5));
@@ -272,7 +290,7 @@ function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShade
 function prog(v,f){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,v));
   gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));gl.linkProgram(p);
   if(!gl.getProgramParameter(p,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(p));return p;}
-const pDye=prog(VS,DYE), pBright=prog(VS,BRIGHT), pBlur=prog(VS,BLUR), pComp=prog(VS,COMP);
+const pMotion=prog(VS,MOTION), pDye=prog(VS,DYE), pBright=prog(VS,BRIGHT), pBlur=prog(VS,BLUR), pComp=prog(VS,COMP);
 
 const quad=gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER,quad);
@@ -286,10 +304,14 @@ function tex(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t;}
 
-let W=1,H=1,BW=1,BH=1;
+let W=1,H=1,BW=1,BH=1,MW=1,MH=1;
 let camTex=[tex(),tex()], camIdx=0;
 let dyeTex=[tex(),tex()], dyeFbo=[gl.createFramebuffer(),gl.createFramebuffer()], dyeSrc=0;
 let bloomTex=[tex(),tex()], bloomFbo=[gl.createFramebuffer(),gl.createFramebuffer()];
+let motTex=[tex(),tex()], motFbo=[gl.createFramebuffer(),gl.createFramebuffer()];
+let segTex=tex();
+gl.bindTexture(gl.TEXTURE_2D,segTex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
 
 function allocFloat(t,w,h){gl.bindTexture(gl.TEXTURE_2D,t);
   gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);}
@@ -310,6 +332,7 @@ function allocTargets(){
     gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
   }
   for(let i=0;i<2;i++){ alloc8(bloomTex[i],BW,BH); attach(bloomFbo[i],bloomTex[i]); }
+  for(let i=0;i<2;i++){ alloc8(motTex[i],MW,MH); attach(motFbo[i],motTex[i]); }
   for(let i=0;i<2;i++) alloc8(camTex[i],W,H);
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
 }
@@ -320,14 +343,15 @@ function resize(){
   if(m>maxEdge){const s=maxEdge/m;w*=s;h*=s;}
   W=Math.max(2,Math.round(w));H=Math.max(2,Math.round(h));
   BW=Math.max(1,W>>2);BH=Math.max(1,H>>2);
+  MW=Math.max(1,W>>3);MH=Math.max(1,H>>3);
   cvs.width=W;cvs.height=H;allocTargets();
 }
 window.addEventListener('resize',resize);
 
 /* ---------- params ---------- */
-const P={ decay:0.95, sens:0.05, smear:0.4, melt:0.15, mosh:0.4, block:24,
-  aber:0.5, pal:1, thermal:0.3, bloom:0.35, breathe:0.25, hue:0.0,
-  shatter:0.15, scan:0.12, base:0.58, grain:0.22 };
+const P={ decay:0.968, sens:0.05, fill:0.7, smear:0.4, melt:0.15, mosh:0.4, block:24,
+  aber:0.5, pal:1, thermal:0.3, bloom:0.4, breathe:0.25, hue:0.0,
+  shatter:0.15, scan:0.12, base:0.55, grain:0.22 };
 const u=(p,n,v)=>gl.uniform1f(gl.getUniformLocation(p,n),v);
 
 /* ---------- photo export ---------- */
@@ -342,6 +366,59 @@ function grabPhoto(){
   },'image/jpeg',0.95);
 }
 
+/* ---------- person segmentation (optional, CDN model) ---------- */
+let segmenter=null, segReady=false, segHasMask=false, segState='off', lastSeg=0, maskDirty=false;
+const maskCanvas=document.createElement('canvas');
+const mctx=maskCanvas.getContext('2d',{willReadFrequently:true});
+let maskImg=null;
+async function loadSeg(){
+  const V='0.10.20';
+  const mod=await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${V}/vision_bundle.mjs`);
+  const {ImageSegmenter,FilesetResolver}=mod;
+  const fileset=await FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${V}/wasm`);
+  const model='https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite';
+  const opts=g=>({baseOptions:{modelAssetPath:model,delegate:g},runningMode:'VIDEO',outputConfidenceMasks:true,outputCategoryMask:false});
+  try{ segmenter=await ImageSegmenter.createFromOptions(fileset,opts('GPU')); }
+  catch(e){ segmenter=await ImageSegmenter.createFromOptions(fileset,opts('CPU')); }
+}
+async function toggleSeg(){
+  if(segState==='loading') return;
+  if(segState==='on'){ segState='off'; buildPanel(); return; }
+  if(segReady){ segState='on'; buildPanel(); return; }
+  segState='loading'; buildPanel();
+  try{ await loadSeg(); segReady=true; segState='on'; toast('person mask ready'); }
+  catch(e){ console.error(e); segState='off'; segReady=false; toast("couldn't load person mask"); }
+  buildPanel();
+}
+function runSeg(now){
+  if(segState!=='on'||!segReady||!segmenter||!video.videoWidth) return;
+  if(now-lastSeg>33){
+    lastSeg=now;
+    try{
+      segmenter.segmentForVideo(video, now, res=>{
+        const masks=res.confidenceMasks;
+        if(masks&&masks.length){
+          const mask=masks[masks.length-1];
+          const w=mask.width,h=mask.height, arr=mask.getAsUint8Array();
+          if(maskCanvas.width!==w||maskCanvas.height!==h){maskCanvas.width=w;maskCanvas.height=h;maskImg=mctx.createImageData(w,h);}
+          const d=maskImg.data;
+          for(let i=0,j=0;i<arr.length;i++,j+=4){const v=arr[i]; d[j]=v; d[j+1]=v; d[j+2]=v; d[j+3]=255;}
+          mctx.putImageData(maskImg,0,0); maskDirty=true;
+        }
+        if(masks) masks.forEach(m=>m.close&&m.close());
+      });
+    }catch(e){}
+  }
+  if(maskDirty){
+    maskDirty=false; segHasMask=true;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D,segTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,maskCanvas);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  }
+}
+
 /* ---------- render ---------- */
 let t0=performance.now(), mirror=0, ready=false;
 function frame(now){
@@ -349,12 +426,33 @@ function frame(now){
   if(!ready||video.readyState<2) return;
   const time=(now-t0)/1000, cur=camIdx, prev=1-camIdx;
 
+  gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D,camTex[cur]);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
   try{ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video); }catch(e){}
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
 
+  runSeg(now);
+
   const dyeDst=1-dyeSrc;
+
+  /* activity mask (low res) + blur to fill the whole moving region */
+  gl.viewport(0,0,MW,MH);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,motFbo[0]);
+  gl.useProgram(pMotion); bindQuad(pMotion);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,camTex[cur]);gl.uniform1i(gl.getUniformLocation(pMotion,'uCam'),0);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,camTex[prev]);gl.uniform1i(gl.getUniformLocation(pMotion,'uPrev'),1);
+  u(pMotion,'uMirror',mirror);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.useProgram(pBlur); bindQuad(pBlur);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,motFbo[1]);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,motTex[0]);gl.uniform1i(gl.getUniformLocation(pBlur,'uTex'),0);
+  gl.uniform2f(gl.getUniformLocation(pBlur,'uDir'),2.5/MW,0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,motFbo[0]);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,motTex[1]);gl.uniform1i(gl.getUniformLocation(pBlur,'uTex'),0);
+  gl.uniform2f(gl.getUniformLocation(pBlur,'uDir'),0,2.5/MH);
+  gl.drawArrays(gl.TRIANGLES,0,3);
 
   /* dye / afterimage */
   gl.bindFramebuffer(gl.FRAMEBUFFER,dyeFbo[dyeDst]); gl.viewport(0,0,W,H);
@@ -362,19 +460,21 @@ function frame(now){
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,dyeTex[dyeSrc]);gl.uniform1i(gl.getUniformLocation(pDye,'uDye'),0);
   gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,camTex[cur]);gl.uniform1i(gl.getUniformLocation(pDye,'uCam'),1);
   gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,camTex[prev]);gl.uniform1i(gl.getUniformLocation(pDye,'uPrev'),2);
+  gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,motTex[0]);gl.uniform1i(gl.getUniformLocation(pDye,'uMotion'),3);
+  gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,segTex);gl.uniform1i(gl.getUniformLocation(pDye,'uSeg'),4);
   gl.uniform2f(gl.getUniformLocation(pDye,'uRes'),W,H);
-  u(pDye,'uTime',time);u(pDye,'uDecay',P.decay);u(pDye,'uSens',P.sens);u(pDye,'uSmear',P.smear);
+  u(pDye,'uTime',time);u(pDye,'uDecay',P.decay);u(pDye,'uSens',P.sens);u(pDye,'uFill',P.fill);u(pDye,'uSmear',P.smear);
   u(pDye,'uMelt',P.melt);u(pDye,'uMosh',P.mosh);u(pDye,'uBlock',P.block);u(pDye,'uHue',P.hue);u(pDye,'uMirror',mirror);
+  u(pDye,'uUseSeg',(segState==='on'&&segReady&&segHasMask)?1:0);
   gl.drawArrays(gl.TRIANGLES,0,3);
 
-  /* bloom: bright-pass + separable blur at quarter res */
+  /* bloom */
   gl.viewport(0,0,BW,BH);
   gl.bindFramebuffer(gl.FRAMEBUFFER,bloomFbo[0]);
   gl.useProgram(pBright); bindQuad(pBright);
-  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,dyeTex[dyeDst]);gl.uniform1i(gl.getUniformLocation(pBright,'uDye'),0);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,dyeTex[dyeDst]);gl.uniform1i(gl.getUniformLocation(pBright,'uTex'),0);
   u(pBright,'uThresh',0.35);
   gl.drawArrays(gl.TRIANGLES,0,3);
-
   gl.useProgram(pBlur); bindQuad(pBlur);
   gl.bindFramebuffer(gl.FRAMEBUFFER,bloomFbo[1]);
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,bloomTex[0]);gl.uniform1i(gl.getUniformLocation(pBlur,'uTex'),0);
@@ -397,7 +497,7 @@ function frame(now){
   u(pComp,'uBase',P.base);u(pComp,'uBloom',P.bloom);u(pComp,'uBreathe',P.breathe);
   gl.drawArrays(gl.TRIANGLES,0,3);
 
-  if(pendingShot){ pendingShot=false; grabPhoto(); }  // capture while buffer is live
+  if(pendingShot){ pendingShot=false; grabPhoto(); }
 
   dyeSrc=dyeDst; camIdx=prev;
 }
@@ -462,12 +562,13 @@ function stopRec(){
 
 /* ---------- presets ---------- */
 const PRESETS={
-  SMEAR:   {decay:.95, sens:.045,smear:.6, melt:.15,mosh:.2, block:24,aber:.4, pal:1,thermal:0,  bloom:.4, breathe:.25,hue:0, shatter:.08,scan:.1, base:.58,grain:.2},
-  ECHO:    {decay:.975,sens:.04, smear:.12,melt:.05,mosh:.1, block:24,aber:.5, pal:0,thermal:0,  bloom:.35,breathe:.2, hue:0, shatter:.06,scan:.08,base:.55,grain:.2},
-  DATAMOSH:{decay:.945,sens:.05, smear:.25,melt:.1, mosh:.9, block:16,aber:.6, pal:1,thermal:.2, bloom:.3, breathe:.15,hue:0, shatter:.25,scan:.12,base:.6, grain:.35},
-  THERMAL: {decay:.96, sens:.045,smear:.4, melt:.12,mosh:.3, block:22,aber:.4, pal:1,thermal:.92,bloom:.55,breathe:.3, hue:0, shatter:.12,scan:.1, base:.34,grain:.22},
-  SHATTER: {decay:.94, sens:.06, smear:.35,melt:.1, mosh:.4, block:20,aber:.9, pal:1,thermal:.15,bloom:.4, breathe:.35,hue:0, shatter:.7, scan:.18,base:.55,grain:.4},
-  ACID:    {decay:.975,sens:.04, smear:.5, melt:.12,mosh:.25,block:26,aber:.8, pal:2,thermal:.9, bloom:.6, breathe:.5, hue:1, shatter:.2, scan:.1, base:.42,grain:.25}
+  GHOST:   {decay:.985,sens:.04, fill:.9, smear:.3, melt:.1, mosh:.15,block:24,aber:.45,pal:1,thermal:.25,bloom:.5, breathe:.3, hue:0, shatter:.08,scan:.1, base:.5, grain:.2},
+  SMEAR:   {decay:.968,sens:.045,fill:.7, smear:.6, melt:.15,mosh:.2, block:24,aber:.4, pal:1,thermal:0,  bloom:.4, breathe:.25,hue:0, shatter:.08,scan:.1, base:.55,grain:.2},
+  ECHO:    {decay:.98, sens:.04, fill:.55,smear:.12,melt:.05,mosh:.1, block:24,aber:.5, pal:0,thermal:0,  bloom:.35,breathe:.2, hue:0, shatter:.06,scan:.08,base:.55,grain:.2},
+  DATAMOSH:{decay:.955,sens:.05, fill:.6, smear:.25,melt:.1, mosh:.9, block:16,aber:.6, pal:1,thermal:.2, bloom:.3, breathe:.15,hue:0, shatter:.25,scan:.12,base:.6, grain:.35},
+  THERMAL: {decay:.972,sens:.045,fill:.75,smear:.4, melt:.12,mosh:.3, block:22,aber:.4, pal:1,thermal:.92,bloom:.55,breathe:.3, hue:0, shatter:.12,scan:.1, base:.34,grain:.22},
+  SHATTER: {decay:.95, sens:.06, fill:.6, smear:.35,melt:.1, mosh:.4, block:20,aber:.9, pal:1,thermal:.15,bloom:.4, breathe:.35,hue:0, shatter:.7, scan:.18,base:.55,grain:.4},
+  ACID:    {decay:.98, sens:.04, fill:.8, smear:.5, melt:.12,mosh:.25,block:26,aber:.8, pal:2,thermal:.9, bloom:.6, breathe:.5, hue:1, shatter:.2, scan:.1, base:.42,grain:.25}
 };
 function applyPreset(n){ Object.assign(P,PRESETS[n]);
   document.querySelectorAll('.rail .chip').forEach(c=>c.classList.toggle('on',c.dataset.p===n));
@@ -477,12 +578,13 @@ function applyPreset(n){ Object.assign(P,PRESETS[n]);
 /* ---------- UI ---------- */
 const rail=document.getElementById('rail');
 Object.keys(PRESETS).forEach((n,i)=>{const b=document.createElement('button');
-  b.className='chip'+(i===0?' on':'');b.textContent=n;b.dataset.p=n;
+  b.className='chip'+(i===1?' on':'');b.textContent=n;b.dataset.p=n;
   b.onclick=()=>applyPreset(n);rail.appendChild(b);});
 
 const PALS=['OFF','THERMAL','ACID','DUO'];
 const FIELDS=[
   ['decay','persistence',0.85,0.995,0.005],
+  ['fill','figure fill',0,1,0.01],
   ['sens','sensitivity',0.01,0.2,0.005],
   ['smear','streak',0,1.5,0.01],
   ['bloom','bloom',0,1,0.01],
@@ -500,6 +602,12 @@ const FIELDS=[
 ];
 const panel=document.getElementById('panel');
 function buildPanel(){ panel.innerHTML='';
+  const srow=document.createElement('div'); srow.className='palrow';
+  const sb=document.createElement('button');
+  sb.className='chip'+(segState==='on'?' on':'');
+  sb.textContent = segState==='on' ? 'PERSON MASK · ON'
+                 : segState==='loading' ? 'PERSON MASK · LOADING' : 'PERSON MASK · OFF';
+  sb.onclick=toggleSeg; srow.appendChild(sb); panel.appendChild(srow);
   const row=document.createElement('div'); row.className='palrow';
   PALS.forEach((name,idx)=>{ const b=document.createElement('button');
     b.className='chip'+(P.pal===idx?' on':''); b.textContent=name;
