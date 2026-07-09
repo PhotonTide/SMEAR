@@ -63,6 +63,8 @@
     backdrop-filter:blur(16px);padding:14px 14px 6px;display:none;
     grid-template-columns:1fr 1fr;gap:12px 20px}
   #panel.open{display:grid}
+  .palrow{grid-column:1/-1;display:flex;gap:6px}
+  .palrow button{flex:1}
   .ctl{display:flex;flex-direction:column;gap:6px}
   .ctl label{display:flex;justify-content:space-between;font-size:10.5px;letter-spacing:.1em;color:var(--dim)}
   .ctl label b{color:var(--text);font-weight:500}
@@ -95,6 +97,7 @@
   <div class="spacer"></div>
   <span id="timer">0:00</span>
   <div class="grp">
+    <button class="chip" id="shot">JPG</button>
     <button class="chip" id="rec"><span class="dot"></span></button>
     <button class="chip" id="tune">TUNE</button>
   </div>
@@ -107,7 +110,7 @@
 
 <div id="gate">
   <h1>SMEAR</h1>
-  <p>reality trails. the moving figure leaves fading afterimages of itself along its path, stamped where it was. tap to wake the camera, then record and export straight to your camera roll.</p>
+  <p>reality trails. the moving figure leaves fading afterimages of itself along its path, stamped where it was. tap to wake the camera, then record video or grab a jpg straight to your camera roll.</p>
   <button id="enter">ENTER</button>
 </div>
 
@@ -115,8 +118,9 @@
 
 <script>
 /* ============================================================
-   SMEAR // reality trails  (afterimage build)
-   in-place decay + optical-flow directional streak + hue-by-age
+   SMEAR // reality trails
+   afterimage: in-place decay + optical-flow streak + hue-by-age
+   composite polish: bloom, non-accumulating breathe, palettes
    ============================================================ */
 const cvs=document.getElementById('gl');
 const gl=cvs.getContext('webgl2',{preserveDrawingBuffer:false,antialias:false,alpha:false});
@@ -138,11 +142,11 @@ float luma(vec3 c){ return dot(c,vec3(0.299,0.587,0.114)); }
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 vec3 hueRot(vec3 c,float a){ const vec3 k=vec3(0.57735);
   float ca=cos(a); return c*ca+cross(k,c)*sin(a)+k*dot(k,c)*(1.0-ca); }
+vec3 hsv2rgb(vec3 c){ vec4 K=vec4(1.,2./3.,1./3.,3.);
+  vec3 p=abs(fract(c.xxx+K.xyz)*6.-K.www); return c.z*mix(K.xxx,clamp(p-K.xxx,0.,1.),c.y); }
 `;
 
-/* afterimage: old paint fades in place, moving figure stamps new paint on top.
-   the only movement of the trail is a small bounded streak along the true
-   optical-flow direction, so it reads as a comet tail, never a drift.        */
+/* afterimage: old paint fades in place, moving figure stamps new paint on top */
 const DYE=`#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 frag;
@@ -159,18 +163,15 @@ void main(){
   float It=luma(cam)-luma(prev);
   float motion=smoothstep(uSens,uSens+0.08, abs(It));
 
-  /* true optical-flow direction (brightness constancy), bounded */
   float Ix=luma(texture(uCam,cuv+vec2(tx.x,0.)).rgb)-luma(texture(uCam,cuv-vec2(tx.x,0.)).rgb);
   float Iy=luma(texture(uCam,cuv+vec2(0.,tx.y)).rgb)-luma(texture(uCam,cuv-vec2(0.,tx.y)).rgb);
   vec2 flow=-It*vec2(Ix,Iy)/(Ix*Ix+Iy*Iy+1e-3);
   vec2 fdir = length(flow)>1e-5 ? normalize(flow) : vec2(0.0);
 
-  /* read the OLD afterimage: mostly in place, streaked a few texels along motion */
   vec2 ruv=uv;
   ruv += fdir * uSmear * 3.0 * tx * (0.4+motion);      // bounded streak, stays put
-  vec2 c=uv-0.5; ruv=0.5+(ruv-0.5)*(1.0-uMelt*0.02);   // optional slow radial melt
+  ruv = 0.5+(ruv-0.5)*(1.0-uMelt*0.02);                // optional slow radial melt
 
-  /* datamosh macroblock displacement */
   vec2 block=floor(uv*uBlock)/uBlock;
   float bh=hash(block+floor(uTime*8.0)*0.137);
   vec2 bdir=normalize(vec2(bh-0.5,hash(block.yx)-0.5)+1e-4);
@@ -178,16 +179,40 @@ void main(){
   ruv -= bdir*bmot*uMosh*0.05*step(0.55,hash(block+0.7));
 
   vec3 old=texture(uDye,ruv).rgb * uDecay;
-  vec3 D=max(old, cam*motion);          // stamp the moving figure into the trail
-  D=hueRot(D, uHue*0.04);               // older paint has cycled further in hue
+  vec3 D=max(old, cam*motion);
+  D=hueRot(D, uHue*0.04);
   frag=vec4(D,1.0);
+}`;
+
+/* bloom: bright-pass extract (runs at quarter res) */
+const BRIGHT=`#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 frag;
+uniform sampler2D uDye; uniform float uThresh;
+`+COMMON+`
+void main(){ vec3 c=texture(uDye,vUv).rgb; float b=smoothstep(uThresh,uThresh+0.25,luma(c));
+  frag=vec4(c*b,1.0); }`;
+
+/* separable gaussian blur */
+const BLUR=`#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 frag;
+uniform sampler2D uTex; uniform vec2 uDir;
+void main(){
+  vec3 s = texture(uTex,vUv).rgb*0.227027;
+  s += texture(uTex,vUv+uDir*1.3846).rgb*0.316216;
+  s += texture(uTex,vUv-uDir*1.3846).rgb*0.316216;
+  s += texture(uTex,vUv+uDir*3.2308).rgb*0.070270;
+  s += texture(uTex,vUv-uDir*3.2308).rgb*0.070270;
+  frag=vec4(s,1.0);
 }`;
 
 const COMP=`#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 frag;
-uniform sampler2D uCam,uDye;
-uniform vec2 uRes; uniform float uTime,uAber,uThermal,uShatter,uScan,uMirror,uGrain,uBase;
+uniform sampler2D uCam,uDye,uBloomTex;
+uniform vec2 uRes;
+uniform float uTime,uAber,uPalMix,uPal,uShatter,uScan,uMirror,uGrain,uBase,uBloom,uBreathe;
 `+COMMON+`
 vec3 thermal(float t){ t=clamp(t,0.,1.);
   vec3 c0=vec3(0.02,0.,0.08),c1=vec3(0.18,0.02,0.38),c2=vec3(0.76,0.07,0.32),
@@ -197,25 +222,47 @@ vec3 thermal(float t){ t=clamp(t,0.,1.);
   if(t<0.6) return mix(c2,c3,(t-0.4)/0.2);
   if(t<0.8) return mix(c3,c4,(t-0.6)/0.2);
   return mix(c4,c5,(t-0.8)/0.2); }
+vec3 acid(float t){ t=clamp(t,0.,1.);
+  return hsv2rgb(vec3(fract(t*0.9+0.02), 0.85, clamp(0.12+t*1.25,0.,1.))); }
+vec3 duo(float t){ t=clamp(t,0.,1.);
+  vec3 a=vec3(0.02,0.0,0.08), b=vec3(0.48,0.29,1.0), c=vec3(1.0,0.23,0.18), d=vec3(1.,1.,.95);
+  if(t<0.4) return mix(a,b,t/0.4);
+  if(t<0.75) return mix(b,c,(t-0.4)/0.35);
+  return mix(c,d,(t-0.75)/0.25); }
+vec3 pal(float t,float m){ if(m<1.5) return thermal(t); if(m<2.5) return acid(t); return duo(t); }
 void main(){
-  vec2 uv=vUv; vec2 cuv=uv; if(uMirror>0.5) cuv.x=1.0-cuv.x;
+  vec2 uv=vUv; float t=uTime;
+
+  /* non-accumulating breathe: warps only the final view, never the stored trail */
+  vec2 bo = uBreathe*0.01*0.5*vec2(
+      sin(uv.y*8.0+t*1.3)+0.5*sin(uv.y*17.0-t*0.7),
+      cos(uv.x*8.0-t*1.1)+0.5*cos(uv.x*15.0+t*0.9));
+  vec2 wuv=uv+bo;
+  vec2 cuv=wuv; if(uMirror>0.5) cuv.x=1.0-cuv.x;
+
   float line=floor(uv.y*uRes.y*0.5);
-  float jit=(hash(vec2(line,floor(uTime*20.0)))-0.5)*uShatter*0.05;
-  vec2 suv=uv+vec2(jit,0.0);
+  float jit=(hash(vec2(line,floor(t*20.0)))-0.5)*uShatter*0.05;
+  vec2 suv=wuv+vec2(jit,0.0);
   vec2 dir=uv-0.5; float ab=uAber*0.02;
+
   vec3 tr;
   tr.r=texture(uDye,suv+dir*ab).r;
   tr.g=texture(uDye,suv).g;
   tr.b=texture(uDye,suv-dir*ab).b;
-  tr=mix(tr, thermal(luma(tr)*1.4), uThermal);
+  if(uPal>0.5) tr=mix(tr, pal(luma(tr)*1.4, uPal), uPalMix);
+
   vec3 base;
   base.r=texture(uCam,cuv+dir*ab*0.4).r;
   base.g=texture(uCam,cuv).g;
   base.b=texture(uCam,cuv-dir*ab*0.4).b;
   base*=uBase;
+
   vec3 col=1.0-(1.0-base)*(1.0-tr);
+  vec3 bloom=texture(uBloomTex,wuv).rgb;      // glow the hot afterimage edges
+  col=1.0-(1.0-col)*(1.0-bloom*uBloom);
+
   col*=1.0-uScan*0.5*(0.5+0.5*sin(uv.y*uRes.y*1.5));
-  col+=(hash(uv+fract(uTime))-0.5)*uGrain*0.15;
+  col+=(hash(uv+fract(t))-0.5)*uGrain*0.15;
   frag=vec4(col,1.0);
 }`;
 
@@ -225,7 +272,7 @@ function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShade
 function prog(v,f){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,v));
   gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));gl.linkProgram(p);
   if(!gl.getProgramParameter(p,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(p));return p;}
-const pDye=prog(VS,DYE), pComp=prog(VS,COMP);
+const pDye=prog(VS,DYE), pBright=prog(VS,BRIGHT), pBlur=prog(VS,BLUR), pComp=prog(VS,COMP);
 
 const quad=gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER,quad);
@@ -239,17 +286,22 @@ function tex(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t;}
 
-let W=1,H=1;
+let W=1,H=1,BW=1,BH=1;
 let camTex=[tex(),tex()], camIdx=0;
 let dyeTex=[tex(),tex()], dyeFbo=[gl.createFramebuffer(),gl.createFramebuffer()], dyeSrc=0;
+let bloomTex=[tex(),tex()], bloomFbo=[gl.createFramebuffer(),gl.createFramebuffer()];
 
-function allocFloat(t){gl.bindTexture(gl.TEXTURE_2D,t);
-  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,W,H,0,gl.RGBA,gl.HALF_FLOAT,null);}
-function alloc8(t){gl.bindTexture(gl.TEXTURE_2D,t);
-  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,W,H,0,gl.RGBA,gl.UNSIGNED_BYTE,null);}
+function allocFloat(t,w,h){gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);}
+function alloc8(t,w,h){gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);}
+function attach(fbo,t){gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);}
+
 function allocTargets(){
   for(let i=0;i<2;i++){
-    HALF?allocFloat(dyeTex[i]):alloc8(dyeTex[i]);
+    HALF?allocFloat(dyeTex[i],W,H):alloc8(dyeTex[i],W,H);
     gl.bindFramebuffer(gl.FRAMEBUFFER,dyeFbo[i]);
     gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,dyeTex[i],0);
     if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE && HALF){
@@ -257,7 +309,8 @@ function allocTargets(){
     }
     gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
   }
-  for(let i=0;i<2;i++) alloc8(camTex[i]);
+  for(let i=0;i<2;i++){ alloc8(bloomTex[i],BW,BH); attach(bloomFbo[i],bloomTex[i]); }
+  for(let i=0;i<2;i++) alloc8(camTex[i],W,H);
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
 }
 function resize(){
@@ -266,14 +319,28 @@ function resize(){
   const maxEdge=1600,m=Math.max(w,h);
   if(m>maxEdge){const s=maxEdge/m;w*=s;h*=s;}
   W=Math.max(2,Math.round(w));H=Math.max(2,Math.round(h));
+  BW=Math.max(1,W>>2);BH=Math.max(1,H>>2);
   cvs.width=W;cvs.height=H;allocTargets();
 }
 window.addEventListener('resize',resize);
 
 /* ---------- params ---------- */
 const P={ decay:0.95, sens:0.05, smear:0.4, melt:0.15, mosh:0.4, block:24,
-  aber:0.5, thermal:0.3, hue:0.0, shatter:0.15, scan:0.12, base:0.58, grain:0.22 };
+  aber:0.5, pal:1, thermal:0.3, bloom:0.35, breathe:0.25, hue:0.0,
+  shatter:0.15, scan:0.12, base:0.58, grain:0.22 };
 const u=(p,n,v)=>gl.uniform1f(gl.getUniformLocation(p,n),v);
+
+/* ---------- photo export ---------- */
+let pendingShot=false;
+function grabPhoto(){
+  cvs.toBlob(b=>{ if(!b){ toast('capture failed'); return; }
+    const url=URL.createObjectURL(b);
+    const a=document.createElement('a'); a.href=url; a.download=`smear_${Date.now()}.jpg`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),4000);
+    toast('saved · jpg');
+  },'image/jpeg',0.95);
+}
 
 /* ---------- render ---------- */
 let t0=performance.now(), mirror=0, ready=false;
@@ -300,15 +367,37 @@ function frame(now){
   u(pDye,'uMelt',P.melt);u(pDye,'uMosh',P.mosh);u(pDye,'uBlock',P.block);u(pDye,'uHue',P.hue);u(pDye,'uMirror',mirror);
   gl.drawArrays(gl.TRIANGLES,0,3);
 
+  /* bloom: bright-pass + separable blur at quarter res */
+  gl.viewport(0,0,BW,BH);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,bloomFbo[0]);
+  gl.useProgram(pBright); bindQuad(pBright);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,dyeTex[dyeDst]);gl.uniform1i(gl.getUniformLocation(pBright,'uDye'),0);
+  u(pBright,'uThresh',0.35);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  gl.useProgram(pBlur); bindQuad(pBlur);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,bloomFbo[1]);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,bloomTex[0]);gl.uniform1i(gl.getUniformLocation(pBlur,'uTex'),0);
+  gl.uniform2f(gl.getUniformLocation(pBlur,'uDir'),1.5/BW,0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,bloomFbo[0]);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,bloomTex[1]);gl.uniform1i(gl.getUniformLocation(pBlur,'uTex'),0);
+  gl.uniform2f(gl.getUniformLocation(pBlur,'uDir'),0,1.5/BH);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
   /* composite */
   gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,W,H);
   gl.useProgram(pComp); bindQuad(pComp);
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,camTex[cur]);gl.uniform1i(gl.getUniformLocation(pComp,'uCam'),0);
   gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,dyeTex[dyeDst]);gl.uniform1i(gl.getUniformLocation(pComp,'uDye'),1);
+  gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,bloomTex[0]);gl.uniform1i(gl.getUniformLocation(pComp,'uBloomTex'),2);
   gl.uniform2f(gl.getUniformLocation(pComp,'uRes'),W,H);
-  u(pComp,'uTime',time);u(pComp,'uAber',P.aber);u(pComp,'uThermal',P.thermal);u(pComp,'uShatter',P.shatter);
-  u(pComp,'uScan',P.scan);u(pComp,'uMirror',mirror);u(pComp,'uGrain',P.grain);u(pComp,'uBase',P.base);
+  u(pComp,'uTime',time);u(pComp,'uAber',P.aber);u(pComp,'uPalMix',P.thermal);u(pComp,'uPal',P.pal);
+  u(pComp,'uShatter',P.shatter);u(pComp,'uScan',P.scan);u(pComp,'uMirror',mirror);u(pComp,'uGrain',P.grain);
+  u(pComp,'uBase',P.base);u(pComp,'uBloom',P.bloom);u(pComp,'uBreathe',P.breathe);
   gl.drawArrays(gl.TRIANGLES,0,3);
+
+  if(pendingShot){ pendingShot=false; grabPhoto(); }  // capture while buffer is live
 
   dyeSrc=dyeDst; camIdx=prev;
 }
@@ -373,12 +462,12 @@ function stopRec(){
 
 /* ---------- presets ---------- */
 const PRESETS={
-  SMEAR:   {decay:.95, sens:.045,smear:.6, melt:.15,mosh:.2, block:24,aber:.4, thermal:0,  hue:0, shatter:.08,scan:.1, base:.58,grain:.2},
-  ECHO:    {decay:.975,sens:.04, smear:.12,melt:.05,mosh:.1, block:24,aber:.5, thermal:0,  hue:0, shatter:.06,scan:.08,base:.55,grain:.2},
-  DATAMOSH:{decay:.945,sens:.05, smear:.25,melt:.1, mosh:.9, block:16,aber:.6, thermal:.2, hue:0, shatter:.25,scan:.12,base:.6, grain:.35},
-  THERMAL: {decay:.96, sens:.045,smear:.4, melt:.12,mosh:.3, block:22,aber:.4, thermal:.92,hue:0, shatter:.12,scan:.1, base:.34,grain:.22},
-  SHATTER: {decay:.94, sens:.06, smear:.35,melt:.1, mosh:.4, block:20,aber:.9, thermal:.15,hue:0, shatter:.7, scan:.18,base:.55,grain:.4},
-  ACID:    {decay:.975,sens:.04, smear:.5, melt:.12,mosh:.25,block:26,aber:.8, thermal:0,  hue:1, shatter:.2, scan:.1, base:.42,grain:.25}
+  SMEAR:   {decay:.95, sens:.045,smear:.6, melt:.15,mosh:.2, block:24,aber:.4, pal:1,thermal:0,  bloom:.4, breathe:.25,hue:0, shatter:.08,scan:.1, base:.58,grain:.2},
+  ECHO:    {decay:.975,sens:.04, smear:.12,melt:.05,mosh:.1, block:24,aber:.5, pal:0,thermal:0,  bloom:.35,breathe:.2, hue:0, shatter:.06,scan:.08,base:.55,grain:.2},
+  DATAMOSH:{decay:.945,sens:.05, smear:.25,melt:.1, mosh:.9, block:16,aber:.6, pal:1,thermal:.2, bloom:.3, breathe:.15,hue:0, shatter:.25,scan:.12,base:.6, grain:.35},
+  THERMAL: {decay:.96, sens:.045,smear:.4, melt:.12,mosh:.3, block:22,aber:.4, pal:1,thermal:.92,bloom:.55,breathe:.3, hue:0, shatter:.12,scan:.1, base:.34,grain:.22},
+  SHATTER: {decay:.94, sens:.06, smear:.35,melt:.1, mosh:.4, block:20,aber:.9, pal:1,thermal:.15,bloom:.4, breathe:.35,hue:0, shatter:.7, scan:.18,base:.55,grain:.4},
+  ACID:    {decay:.975,sens:.04, smear:.5, melt:.12,mosh:.25,block:26,aber:.8, pal:2,thermal:.9, bloom:.6, breathe:.5, hue:1, shatter:.2, scan:.1, base:.42,grain:.25}
 };
 function applyPreset(n){ Object.assign(P,PRESETS[n]);
   document.querySelectorAll('.rail .chip').forEach(c=>c.classList.toggle('on',c.dataset.p===n));
@@ -391,16 +480,19 @@ Object.keys(PRESETS).forEach((n,i)=>{const b=document.createElement('button');
   b.className='chip'+(i===0?' on':'');b.textContent=n;b.dataset.p=n;
   b.onclick=()=>applyPreset(n);rail.appendChild(b);});
 
+const PALS=['OFF','THERMAL','ACID','DUO'];
 const FIELDS=[
   ['decay','persistence',0.85,0.995,0.005],
   ['sens','sensitivity',0.01,0.2,0.005],
   ['smear','streak',0,1.5,0.01],
-  ['melt','melt',0,1,0.01],
+  ['bloom','bloom',0,1,0.01],
+  ['breathe','breathe',0,1,0.01],
+  ['thermal','palette mix',0,1,0.01],
+  ['hue','hue cycle',0,1,0.01],
+  ['aber','chromatic',0,1.5,0.01],
   ['mosh','datamosh',0,1.5,0.01],
   ['block','block size',6,60,1],
-  ['aber','chromatic',0,1.5,0.01],
-  ['thermal','thermal',0,1,0.01],
-  ['hue','hue cycle',0,1,0.01],
+  ['melt','melt',0,1,0.01],
   ['shatter','shatter',0,1,0.01],
   ['scan','scanlines',0,0.6,0.01],
   ['base','base image',0,1,0.01],
@@ -408,6 +500,13 @@ const FIELDS=[
 ];
 const panel=document.getElementById('panel');
 function buildPanel(){ panel.innerHTML='';
+  const row=document.createElement('div'); row.className='palrow';
+  PALS.forEach((name,idx)=>{ const b=document.createElement('button');
+    b.className='chip'+(P.pal===idx?' on':''); b.textContent=name;
+    b.onclick=()=>{ P.pal=idx; buildPanel(); };
+    row.appendChild(b);
+  });
+  panel.appendChild(row);
   FIELDS.forEach(([k,lab,mn,mx,st])=>{
     const w=document.createElement('div');w.className='ctl';
     const l=document.createElement('label');
@@ -422,6 +521,7 @@ buildPanel();
 function setChip(id,on){document.getElementById(id).classList.toggle('on',on);}
 document.getElementById('tune').onclick=e=>{panel.classList.toggle('open');
   e.currentTarget.classList.toggle('on',panel.classList.contains('open'));};
+document.getElementById('shot').onclick=()=>{ pendingShot=true; };
 document.getElementById('rec').onclick=()=>{ if(recorder&&recorder.state==='recording') stopRec(); else startRec(); };
 document.getElementById('flip').onclick=()=>{ if(usingFile){facing='environment';startCam();return;}
   facing=facing==='user'?'environment':'user';startCam();};
