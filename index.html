@@ -421,7 +421,7 @@ function frame(now){
   u(pDye,'uTime',time);u(pDye,'uDecay',P.decay);u(pDye,'uSens',P.sens);u(pDye,'uFill',P.fill);u(pDye,'uSmear',P.smear);
   u(pDye,'uMosh',P.mosh);u(pDye,'uBlock',P.block);u(pDye,'uHue',P.hue);u(pDye,'uMirror',mirror);
   let echoPulse=0;
-  if(P.echo>0.001){ const period=0.07+P.echo*1.1; const idx=Math.floor(time/period);
+  if(P.echo>0.001){ const period=0.04+P.echo*0.5; const idx=Math.floor(time/period);
     if(idx!==lastEchoIdx){ lastEchoIdx=idx; echoPulse=1; } }
   u(pDye,'uEcho',P.echo);u(pDye,'uEchoPulse',echoPulse);
   gl.drawArrays(gl.TRIANGLES,0,3);
